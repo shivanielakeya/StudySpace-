@@ -3,8 +3,26 @@ const BASE_INTERVALS = [1, 3, 7, 15, 30];
 const LEVELS = ["Need to Relearn", "Basic Understanding", "Understand Well", "Interview Ready"];
 const STATUS_OPTIONS = ["Learning", "To review", "Completed"];
 const DEFAULT_SUBJECTS = ["Python", "SQL", "Statistics", "Excel", "Power BI", "Machine Learning"];
-let persistenceFailed = false;
-let startupWarning = "";
+let authUser = null;
+let profile = null;
+let authMode = (() => {
+  const queryMode = new URLSearchParams(window.location.search).get("mode");
+  if (queryMode === "invite" || queryMode === "recovery") return queryMode;
+  const hashType = new URLSearchParams(window.location.hash.slice(1)).get("type");
+  return hashType === "invite" || hashType === "recovery" ? hashType : "";
+})();
+let authNotice = "";
+let accountLoading = false;
+let accountLoaded = false;
+let accountLoadVersion = 0;
+let hasCloudData = false;
+let persistenceBusy = false;
+let legacyData = null;
+let legacyDataError = "";
+let legacyBackupDownloaded = false;
+let legacyBackupConfirmed = false;
+let legacyOverwriteConfirmed = false;
+let migrationInProgress = false;
 const iconPaths = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   book: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22z"/><path d="M4 5.5v14A2.5 2.5 0 0 1 6.5 17H20"/>',
@@ -66,52 +84,26 @@ const isSafeResourceUrl = (value) => {
 const esc = (value = "") => String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
 const uid = () => (globalThis.crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 function initialData() {
-  const samples = [
-    ["Linear Regression", "Statistics", "Understand Well", "Learning", -8, "Understand how the least-squares line minimizes residual error. Check assumptions before interpreting coefficients.", 2],
-    ["SQL Window Functions", "SQL", "Basic Understanding", "To review", -3, "OVER() defines the window. PARTITION BY resets the calculation; ORDER BY defines the sequence. Compare ROW_NUMBER with RANK.", 1],
-    ["List Comprehensions", "Python", "Interview Ready", "Completed", 2, "A concise way to build lists from iterables. Keep nested comprehensions readable; use a loop for complex logic.", 4],
-    ["Pivot Tables", "Excel", "Understand Well", "Learning", 0, "Drag fields into Rows, Columns, Values, and Filters. Verify the summary operation before trusting totals.", 2],
-    ["Hypothesis Testing", "Statistics", "Need to Relearn", "To review", -4, "Write H₀ and H₁ first. Interpret the p-value in context and never treat it as the probability that H₀ is true.", 3],
-    ["Data Cleaning with pandas", "Python", "Basic Understanding", "Learning", -2, "Inspect missingness, normalize types, and validate row counts after every transformation.", 1],
-    ["DAX Measures", "Power BI", "Understand Well", "Learning", -6, "Measures are evaluated in filter context. CALCULATE modifies that context; test totals as well as row values.", 3],
-    ["Decision Trees", "Machine Learning", "Basic Understanding", "Learning", -1, "A tree recursively splits features to reduce impurity. Control depth to manage overfitting.", 2],
-    ["VLOOKUP & XLOOKUP", "Excel", "Interview Ready", "Completed", 5, "XLOOKUP supports reverse lookup and an explicit not-found result. Lock lookup ranges when copying formulas.", 5],
-    ["Joins & Aggregations", "SQL", "Understand Well", "Learning", 1, "Choose join keys carefully, then aggregate at the intended grain. Validate whether a join duplicates records.", 2],
-    ["Feature Scaling", "Machine Learning", "Need to Relearn", "To review", -5, "Standardization uses training-set mean and variance. Fit preprocessing on training data only to avoid leakage.", 1],
-    ["Conditional Formatting", "Power BI", "Basic Understanding", "Learning", 0, "Use restrained color scales to expose patterns. Keep rules consistent and test how blanks are displayed.", 1],
-  ];
   return {
-    topics: samples.map(([name, subject, level, status, lastOffset, notes, revisionCount], index) => {
-      const lastStudied = shiftDate(lastOffset);
-      const interval = BASE_INTERVALS[Math.min(revisionCount, 4)];
-      const nextRevision = status === "Completed" ? null : shiftDate(lastOffset + interval);
-      return {
-        id: `sample-${index + 1}`, name, subject, level, status, lastStudied, nextRevision, revisionCount,
-        description: `${name} concepts and practical notes.`, notes, resource: "",
-        history: revisionCount ? Array.from({ length: revisionCount }, (_, n) => ({
-          date: shiftDate(lastOffset - (revisionCount - n - 1) * 7), level: LEVELS[Math.max(0, LEVELS.indexOf(level) - (revisionCount - n - 1) % 2)], note: "Quick recall and practice questions."
-        })) : []
-      };
-    }),
+    topics: [],
     subjects: [...DEFAULT_SUBJECTS],
     intervals: [...BASE_INTERVALS],
     dark: false,
     activities: [],
+    legacyImportCompletedAt: null,
   };
 }
-function loadData() {
+function detectLegacyData() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (!saved) return initialData();
-    const parsed = JSON.parse(saved);
-    return { ...initialData(), ...parsed, ...validateImport(parsed) };
+    if (!saved) return null;
+    return validateImport(JSON.parse(saved));
   } catch (error) {
-    console.error("Could not load StudySpace data.", error);
-    startupWarning = "Saved data could not be read. The app opened sample data; export or restore a valid backup before saving changes.";
-    return initialData();
+    legacyDataError = error.message || "Saved browser data could not be read.";
+    return null;
   }
 }
-let data = loadData();
+let data = initialData();
 let route = "dashboard";
 let selectedId = null;
 let revisionQueue = [];
@@ -123,20 +115,21 @@ let filters = { search: "", subject: "", status: "", level: "", revision: "", so
 let roomTab = "All";
 const app = document.querySelector("#app");
 
-function save() {
+async function save() {
+  if (persistenceBusy) return false;
+  persistenceBusy = true;
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    persistenceFailed = false;
+    await StudySpaceData.save(data);
+    hasCloudData = true;
     return true;
-  } catch (error) {
-    console.error("Could not save StudySpace data.", error);
-    persistenceFailed = true;
-    toast("Your changes are not saved. Browser storage could not be written.");
+  } catch {
+    toast("Your changes could not be saved. Check your connection and try again.");
     return false;
+  } finally {
+    persistenceBusy = false;
   }
 }
 function toast(message) {
-  if (persistenceFailed && message !== "Your changes are not saved. Browser storage could not be written.") return;
   document.querySelector(".toast")?.remove();
   const el = document.createElement("div");
   el.className = "toast";
@@ -145,6 +138,177 @@ function toast(message) {
   el.textContent = message;
   document.body.append(el);
   setTimeout(() => el.remove(), 2600);
+}
+function initials(name, email = "") {
+  const words = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (words.length > 1) return `${words[0][0]}${words[words.length - 1][0]}`.toUpperCase();
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return String(email).slice(0, 2).toUpperCase() || "SS";
+}
+function avatarMarkup(sizeClass = "") {
+  const image = profile?.avatar_url && isSafeResourceUrl(profile.avatar_url)
+    ? `<img src="${esc(profile.avatar_url)}" alt="">`
+    : esc(initials(profile?.full_name, authUser?.email));
+  return `<span class="avatar ${sizeClass}">${image}</span>`;
+}
+function clearAuthModeFromUrl() {
+  window.history.replaceState(null, "", window.location.pathname);
+}
+function renderAuth(message = authNotice, isError = Boolean(message)) {
+  document.body.classList.remove("dark");
+  const configured = StudySpaceSupabase.configured;
+  if (!configured) isError = true;
+  const isRecovery = authMode === "recovery";
+  const isInvite = authMode === "invite";
+  const isForgot = authMode === "forgot";
+  const title = isInvite ? "Set up your account" : isRecovery ? "Choose a new password" : isForgot ? "Reset your password" : "Welcome back";
+  const description = isInvite
+    ? "Your invitation is ready. Set a password to finish joining StudySpace."
+    : isRecovery
+      ? "Choose a new password for your StudySpace account."
+      : isForgot
+        ? "We’ll send a secure password reset link to your email."
+        : "Sign in to continue to your private study space.";
+  let form = "";
+  if (!configured) {
+    message = "StudySpace needs a Supabase project URL and publishable key. Configure supabase-config.js, then reload this page.";
+  } else if (isInvite && !authUser) {
+    form = `<button class="btn btn-primary auth-submit" type="button" data-auth-mode="login">Back to sign in</button>`;
+  } else if (isRecovery && !authUser) {
+    form = `<p class="auth-invite-note">This password reset link is invalid or has expired. Request a new link to continue.</p>
+      <button class="btn btn-primary auth-submit" type="button" data-auth-mode="forgot">Request another reset link</button>
+      <button class="text-action auth-back" type="button" data-auth-mode="login">Back to sign in</button>`;
+  } else if (isInvite) {
+    form = `<form id="invite-form" class="auth-form">
+      <label class="form-field"><span>Full name</span><input class="field-control" name="fullName" maxlength="100" autocomplete="name" required value="${esc(authUser?.user_metadata?.full_name || "")}"></label>
+      <label class="form-field"><span>Email</span><input class="field-control" type="email" value="${esc(authUser?.email || "")}" disabled></label>
+      <label class="form-field"><span>Password</span><input class="field-control" name="password" type="password" minlength="10" autocomplete="new-password" required></label>
+      <label class="form-field"><span>Confirm password</span><input class="field-control" name="confirmPassword" type="password" minlength="10" autocomplete="new-password" required></label>
+      <button class="btn btn-primary auth-submit" type="submit">Set password and continue</button>
+    </form>`;
+  } else if (isRecovery) {
+    form = `<form id="recovery-form" class="auth-form">
+      <label class="form-field"><span>New password</span><input class="field-control" name="password" type="password" minlength="10" autocomplete="new-password" required></label>
+      <label class="form-field"><span>Confirm new password</span><input class="field-control" name="confirmPassword" type="password" minlength="10" autocomplete="new-password" required></label>
+      <button class="btn btn-primary auth-submit" type="submit">Save new password</button>
+    </form>`;
+  } else if (isForgot) {
+    form = `<form id="forgot-form" class="auth-form">
+      <label class="form-field"><span>Email address</span><input class="field-control" name="email" type="email" autocomplete="email" required></label>
+      <button class="btn btn-primary auth-submit" type="submit">Send reset link</button>
+      <button class="text-action auth-back" type="button" data-auth-mode="login">Back to sign in</button>
+    </form>`;
+  } else {
+    form = `<form id="login-form" class="auth-form">
+      <label class="form-field"><span>Email address</span><input class="field-control" name="email" type="email" autocomplete="email" required></label>
+      <label class="form-field"><span>Password</span><input class="field-control" name="password" type="password" autocomplete="current-password" required></label>
+      <button class="btn btn-primary auth-submit" type="submit">Sign in</button>
+      <button class="text-action auth-back" type="button" data-auth-mode="forgot">Forgot password?</button>
+      <p class="auth-invite-note">StudySpace is invite-only. Ask your administrator for an invitation; public registration is disabled.</p>
+    </form>`;
+  }
+  app.innerHTML = `<main class="auth-shell"><section class="auth-card">
+    <div class="auth-brand"><span class="brand-mark">${icon("book", 18)}</span><div><div class="brand-name">StudySpace</div><div class="brand-caption">your learning, in focus</div></div></div>
+    <div class="auth-heading"><h1>${title}</h1><p>${description}</p></div>
+    ${message ? `<div class="auth-message ${isError ? "auth-message-error" : "auth-message-success"}" role="${isError ? "alert" : "status"}" aria-live="polite">${esc(message)}</div>` : ""}
+    ${configured ? form : ""}
+  </section><p class="auth-footer">A calm space for focused learning.</p></main>`;
+}
+function renderAccountLoading() {
+  app.innerHTML = `<main class="auth-shell"><section class="auth-card auth-loading"><div class="brand-mark">${icon("book", 18)}</div><h1>Loading your study space</h1><p>Connecting securely to your account…</p></section></main>`;
+}
+function renderAccountError(message) {
+  accountLoading = false;
+  accountLoaded = false;
+  app.innerHTML = `<main class="auth-shell"><section class="auth-card"><div class="brand-mark">${icon("book", 18)}</div><h1>Couldn’t load your study space</h1><p class="auth-message auth-message-error" role="alert">${esc(message)}</p><button class="btn btn-primary auth-submit" data-action="retry-account">Try again</button><button class="text-action auth-back" data-action="logout">Sign out</button></section></main>`;
+}
+function authErrorMessage(error) {
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("invalid login credentials")) return "Email or password is incorrect.";
+  if (message.includes("email not confirmed")) return "Confirm your invitation email before signing in.";
+  if (message.includes("passwords do not match")) return "The passwords do not match.";
+  if (message.includes("enter your full name")) return "Enter your full name to finish setting up the account.";
+  if (message.includes("expired")) return "This password link has expired. Request a new link and try again.";
+  if (message.includes("password should be")) return "Choose a password with at least 10 characters.";
+  if (message.includes("rate limit")) return "Too many attempts. Wait a little and try again.";
+  if (message.includes("fetch") || message.includes("network")) return "Could not reach Supabase. Check your connection and project configuration.";
+  return "That request could not be completed. Check your details and try again.";
+}
+async function loadAccount(user) {
+  if (accountLoading && authUser?.id === user.id) return;
+  accountLoading = true;
+  accountLoaded = false;
+  authUser = user;
+  const version = ++accountLoadVersion;
+  renderAccountLoading();
+  try {
+    const result = await StudySpaceData.load(user.id);
+    if (version !== accountLoadVersion) return;
+    profile = result.profile;
+    data = result.data;
+    hasCloudData = result.hasCloudData;
+    legacyDataError = "";
+    legacyData = detectLegacyData();
+    legacyBackupDownloaded = false;
+    legacyBackupConfirmed = false;
+    legacyOverwriteConfirmed = false;
+    accountLoading = false;
+    accountLoaded = true;
+    authNotice = "";
+    authMode = "";
+    route = "dashboard";
+    render();
+  } catch {
+    if (version !== accountLoadVersion) return;
+    accountLoading = false;
+    renderAccountError("Your account is signed in, but the study data could not be loaded. Check your connection and confirm the database migration has been run.");
+  }
+}
+async function handleAuthState(event, session) {
+  if (!session?.user) {
+    accountLoadVersion += 1;
+    accountLoading = false;
+    accountLoaded = false;
+    authUser = null;
+    profile = null;
+    hasCloudData = false;
+    data = initialData();
+    if (event === "PASSWORD_RECOVERY") authMode = "recovery";
+    if (authMode !== "invite" && authMode !== "recovery" && authMode !== "forgot") authMode = "login";
+    authNotice = authMode === "invite"
+      ? "This invitation link is invalid or has expired. Ask the administrator to send a new one."
+      : authMode === "recovery" ? "This password reset link is invalid or has expired." : "";
+    renderAuth();
+    return;
+  }
+  authUser = session.user;
+  if (event === "PASSWORD_RECOVERY") authMode = "recovery";
+  if (session.user.invited_at && session.user.user_metadata?.studyspace_password_setup !== true) authMode = "invite";
+  if (authMode === "invite" || authMode === "recovery") {
+    accountLoaded = false;
+    renderAuth();
+    return;
+  }
+  if (accountLoaded && profile?.id === session.user.id) return;
+  await loadAccount(session.user);
+}
+async function initializeAuth() {
+  if (!StudySpaceSupabase.configured) {
+    authMode = "config";
+    renderAuth();
+    return;
+  }
+  StudySpaceAuth.onAuthStateChange((event, session) => {
+    queueMicrotask(() => {
+      handleAuthState(event, session).catch(() => renderAuth("Your sign-in state could not be refreshed. Reload the page and try again."));
+    });
+  });
+  try {
+    const session = await StudySpaceAuth.getSession();
+    await handleAuthState("INITIAL_SESSION", session);
+  } catch {
+    renderAuth("Could not check your session. Check your connection and reload the page.");
+  }
 }
 function levelClass(level) {
   return ({ "Interview Ready": "badge-ready", "Understand Well": "badge-well", "Basic Understanding": "badge-basic", "Need to Relearn": "badge-relearn" })[level] || "badge-basic";
@@ -173,7 +337,7 @@ function navMarkup(mobile = false) {
     <div class="nav-label" style="margin-top:24px">Insights</div><nav class="nav-group" aria-label="Insights navigation">${items.slice(3).join("")}</nav>
     <div class="sidebar-spacer"></div>
     <div class="streak-card"><div class="streak-head"><span>Learning streak</span>${icon("flame", 15)}</div><p><strong>4 days</strong> in a row. Small steps add up — keep going!</p></div>
-    <div class="profile"><div class="avatar">VS</div><div class="profile-copy"><div class="profile-name">My Study Space</div><div class="profile-sub">Personal workspace</div></div></div>
+    <button class="profile profile-link" data-route="settings" aria-label="Open account settings">${avatarMarkup()}<span class="profile-copy"><span class="profile-name">${esc(profile?.full_name || "Your profile")}</span><span class="profile-sub">${esc(authUser?.email || "")}</span></span></button>
   </aside>`;
 }
 function shell(content) {
@@ -181,7 +345,7 @@ function shell(content) {
   app.innerHTML = `<div class="app-shell ${data.dark ? "dark" : ""}">${navMarkup()}
     <div class="main-wrap">
       <header class="topbar"><div class="breadcrumbs">StudySpace <span style="color:#c1bdca"> / </span> <strong>${title}</strong></div>
-        <div class="topbar-right"><span class="date-pill">${new Date().toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}</span><button class="icon-btn" data-action="theme" aria-label="Toggle theme">${icon(data.dark ? "sun" : "sparkle", 16)}</button><div class="avatar">VS</div></div>
+        <div class="topbar-right"><span class="date-pill">${new Date().toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}</span><button class="icon-btn" data-action="theme" aria-label="Toggle theme">${icon(data.dark ? "sun" : "sparkle", 16)}</button><span class="account-email">${esc(authUser?.email || "")}</span>${avatarMarkup()}<button class="btn btn-secondary btn-logout" data-action="logout">Sign out</button></div>
       </header><main class="content">${content}</main>
     </div>${navMarkup(true)}</div>`;
 }
@@ -219,7 +383,8 @@ function renderDashboard() {
     return schedulePriority(a, b) || aDue - bDue;
   })[0];
   const recent = [...data.activities].slice(-3).reverse();
-  shell(`${heading("Good morning, Varun", "Ready to learn something new? Here’s your study space at a glance.", `<button class="btn btn-primary" data-action="add">${icon("plus", 15)} Quick Add Topic</button>`)}
+  const firstName = (profile?.full_name || authUser?.email?.split("@")[0] || "there").trim().split(/\s+/)[0];
+  shell(`${heading(`Good morning, ${esc(firstName)}`, "Ready to learn something new? Here’s your study space at a glance.", `<button class="btn btn-primary" data-action="add">${icon("plus", 15)} Quick Add Topic</button>`)}
     <section class="stats-grid">
       ${statCard("Total topics", total, "book", "", `${icon("arrow", 10)} Your knowledge library`)}
       ${statCard("Completed topics", completed, "check", "green", `${total ? Math.round(completed / total * 100) : 0}% of your collection`)}
@@ -384,10 +549,27 @@ function renderProgress() {
 function renderSettings() {
   shell(`${heading("Settings", "Make your study space work the way you do.")}
     <section class="settings-layout">
+      <div class="card settings-card"><h2 class="section-title">Account</h2><p>Your StudySpace profile and sign-in details.</p>
+        <form id="profile-form" class="form-grid">
+          <div class="form-field full"><label for="profile-name">Full name</label><input id="profile-name" class="field-control" name="fullName" maxlength="100" required value="${esc(profile?.full_name || "")}"></div>
+          <div class="form-field full"><label for="profile-email">Email</label><input id="profile-email" class="field-control" type="email" value="${esc(profile?.email || authUser?.email || "")}" disabled></div>
+          <div class="form-field full"><label for="profile-avatar">Profile picture URL (optional)</label><input id="profile-avatar" class="field-control" name="avatarUrl" type="url" placeholder="https://..." value="${esc(profile?.avatar_url || "")}"></div>
+          <div class="form-field full"><small class="section-subtitle">Account created ${profile?.created_at ? new Date(profile.created_at).toLocaleDateString() : "—"}</small></div>
+          <div class="form-field full"><button class="btn btn-primary" type="submit">Save profile</button></div>
+        </form>
+        <div class="setting-row"><div><strong>Password</strong><small>Send a password reset email to your account</small></div><button class="btn btn-secondary" data-action="send-reset">Reset password</button></div>
+        <div class="setting-row"><div><strong>Session</strong><small>${esc(authUser?.email || "")}</small></div><button class="btn btn-secondary" data-action="logout">Sign out</button></div>
+      </div>
       <div class="card settings-card"><h2 class="section-title">Appearance</h2><p>Set the tone for your next study session.</p><div class="setting-row"><div><strong>Dark mode</strong><small>Use a softer, darker workspace</small></div><button class="switch ${data.dark ? "on" : ""}" data-action="theme" role="switch" aria-checked="${data.dark}" aria-label="Toggle dark mode"></button></div></div>
       <div class="card settings-card"><h2 class="section-title">Revision intervals</h2><p>Default spacing for each review. We bring weaker topics back sooner.</p>${data.intervals.map((days, index) => `<div class="setting-row"><div><strong>Revision ${index + 1}</strong><small>${index === 0 ? "First review" : `After revision ${index}`} · ${dayLabel(days)}</small></div><label style="display:flex;align-items:center;gap:5px"><input class="field-control interval-input" style="width:62px;min-height:32px;text-align:center;padding:0 6px" type="number" min="1" max="365" value="${days}" data-interval="${index}" aria-label="Days until revision ${index + 1}"><span class="section-subtitle">days</span></label></div>`).join("")}</div>
       <div class="card settings-card"><h2 class="section-title">Manage subjects</h2><p>Keep your topic library organized around what you’re learning.</p><div class="subject-chips">${data.subjects.map((subject) => `<span class="subject-chip">${esc(subject)}<button data-action="remove-subject" data-subject="${esc(subject)}" aria-label="Remove ${esc(subject)}">×</button></span>`).join("")}</div><form class="inline-form" id="subject-form"><input class="field-control" name="subject" placeholder="New subject" maxlength="30" required aria-label="New subject"><button class="btn btn-primary">Add subject</button></form></div>
-      <div class="card settings-card"><h2 class="section-title">Your data</h2><p>Your study data stays in this browser. Download a copy or restore a previous export.</p><div class="setting-row"><div><strong>Export topics</strong><small>Download your study data as JSON</small></div><button class="btn btn-secondary" data-action="export">Export</button></div><div class="setting-row"><div><strong>Import topics</strong><small>Restore a StudySpace JSON export</small></div><button class="btn btn-secondary" data-action="import">Choose file</button><input id="import-file" type="file" accept="application/json,.json" hidden></div></div>
+      <div class="card settings-card"><h2 class="section-title">Your data</h2><p>Your study data is stored in your private StudySpace account. Export a backup or restore a StudySpace JSON file.</p><div class="setting-row"><div><strong>Export topics</strong><small>Download your study data as JSON</small></div><button class="btn btn-secondary" data-action="export">Export</button></div><div class="setting-row"><div><strong>Import topics</strong><small>Replace your cloud data with a StudySpace JSON export</small></div><button class="btn btn-secondary" data-action="import">Choose file</button><input id="import-file" type="file" accept="application/json,.json" hidden></div></div>
+      <div class="card settings-card migration-card"><h2 class="section-title">Import browser data</h2>
+        ${data.legacyImportCompletedAt ? `<p class="migration-success">Your browser data was imported on ${new Date(data.legacyImportCompletedAt).toLocaleDateString()}. The original browser copy has not been deleted.</p>` : legacyDataError ? `<p class="migration-error">${esc(legacyDataError)} You can still use the export option above to download a copy of the original browser data.</p>` : legacyData ? `<p>We found ${legacyData.topics.length} topic${legacyData.topics.length === 1 ? "" : "s"} in this browser. Download a backup before importing. Your browser copy will remain untouched.</p>
+          <div class="migration-actions"><button class="btn btn-secondary" data-action="export-legacy">Download browser backup</button><label class="migration-check"><input id="migration-backup-confirm" type="checkbox" ${legacyBackupConfirmed ? "checked" : ""} ${legacyBackupDownloaded ? "" : "disabled"}> I downloaded the backup</label></div>
+          ${hasCloudData ? `<label class="migration-check migration-overwrite"><input id="migration-overwrite-confirm" type="checkbox" ${legacyOverwriteConfirmed ? "checked" : ""}> I understand this will replace all existing cloud study data</label>` : ""}
+          <button class="btn btn-primary" data-action="migrate" ${legacyBackupDownloaded && legacyBackupConfirmed && (!hasCloudData || legacyOverwriteConfirmed) ? "" : "disabled"}>Import browser data to this account</button>` : `<p>No saved StudySpace browser data was found to import.</p>`}
+      </div>
     </section>`);
 }
 function renderSession() {
@@ -454,6 +636,9 @@ function beginSession(topicId) {
   render();
 }
 function render() {
+  if (!authUser) { renderAuth(); return; }
+  if (accountLoading) { renderAccountLoading(); return; }
+  if (!accountLoaded) { renderAccountError("Your account is not ready yet. Reload the page or sign in again."); return; }
   document.body.classList.toggle("dark", data.dark);
   if (route === "dashboard") renderDashboard();
   else if (route === "topics") renderTopics();
@@ -464,12 +649,109 @@ function render() {
   else if (route === "progress") renderProgress();
   else renderDashboard();
 }
-app.addEventListener("click", (event) => {
+function setAuthFeedback(form, message, isError = true) {
+  let feedback = form.querySelector(".auth-form-feedback");
+  if (!feedback) {
+    feedback = document.createElement("div");
+    feedback.className = "auth-form-feedback";
+    feedback.setAttribute("role", isError ? "alert" : "status");
+    feedback.setAttribute("aria-live", "polite");
+    form.prepend(feedback);
+  }
+  feedback.className = `auth-form-feedback ${isError ? "auth-message-error" : "auth-message-success"}`;
+  feedback.textContent = message;
+}
+async function handleAuthFormSubmit(event) {
+  const formElement = event.target;
+  const form = new FormData(formElement);
+  const button = formElement.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+  try {
+    if (formElement.id === "login-form") {
+      await StudySpaceAuth.signIn(String(form.get("email")).trim(), String(form.get("password")));
+      authNotice = "";
+    } else if (formElement.id === "forgot-form") {
+      await StudySpaceAuth.sendPasswordReset(String(form.get("email")).trim());
+      authNotice = "If that address belongs to an invited account, a password reset link is on its way.";
+      renderAuth(authNotice, false);
+    } else if (formElement.id === "invite-form" || formElement.id === "recovery-form") {
+      const password = String(form.get("password"));
+      if (password.length < 10) throw new Error("Choose a password with at least 10 characters.");
+      if (password !== String(form.get("confirmPassword"))) throw new Error("The passwords do not match.");
+      const fullName = String(form.get("fullName") || "").trim();
+      if (formElement.id === "invite-form" && !fullName) throw new Error("Enter your full name.");
+      if (!authUser) throw new Error("This password link has expired. Request a new link and try again.");
+      const user = await StudySpaceAuth.updatePassword(password, fullName);
+      authUser = user;
+      authMode = "";
+      authNotice = "";
+      clearAuthModeFromUrl();
+      await loadAccount(user);
+      if (formElement.id === "recovery-form") toast("Password updated.");
+    }
+  } catch (error) {
+    setAuthFeedback(formElement, authErrorMessage(error));
+    if (button) button.disabled = false;
+  }
+}
+async function updateProfile(formElement) {
+  const form = new FormData(formElement);
+  const fullName = String(form.get("fullName") || "").trim();
+  const avatarUrl = String(form.get("avatarUrl") || "").trim();
+  if (!fullName || fullName.length > 100) { toast("Enter a name between 1 and 100 characters."); return; }
+  if (!isSafeResourceUrl(avatarUrl)) { toast("Profile picture links must use http:// or https://."); return; }
+  const button = formElement.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+  try {
+    profile = await StudySpaceAuth.updateProfile(authUser.id, { fullName, avatarUrl });
+    renderSettings();
+    toast("Profile updated.");
+  } catch {
+    toast("Your profile could not be saved. Check your connection and try again.");
+    if (button) button.disabled = false;
+  }
+}
+async function signOut() {
+  try {
+    await StudySpaceAuth.signOut();
+  } catch {
+    toast("Could not sign out. Check your connection and try again.");
+  }
+}
+async function migrateLegacyData() {
+  if (migrationInProgress || !legacyData || data.legacyImportCompletedAt || !legacyBackupDownloaded || !legacyBackupConfirmed) return;
+  if (hasCloudData && !legacyOverwriteConfirmed) {
+    toast("Confirm that replacing existing cloud data is what you want.");
+    return;
+  }
+  if (hasCloudData && !window.confirm("This will replace all study data currently in your cloud account. Your downloaded browser backup will not be changed. Continue?")) return;
+  migrationInProgress = true;
+  const previous = data;
+  data = { ...legacyData, legacyImportCompletedAt: new Date().toISOString() };
+  if (!await save()) {
+    data = previous;
+    migrationInProgress = false;
+    renderSettings();
+    return;
+  }
+  legacyData = null;
+  migrationInProgress = false;
+  renderSettings();
+  toast("Browser study data imported. The original LocalStorage copy remains in this browser.");
+}
+app.addEventListener("click", async (event) => {
+  if (persistenceBusy) { toast("Your changes are still being saved."); return; }
   if (event.target.classList.contains("modal-backdrop")) { event.target.remove(); return; }
-  const target = event.target.closest("[data-action],[data-route],[data-tab],[data-level]");
+  const target = event.target.closest("[data-action],[data-route],[data-tab],[data-level],[data-auth-mode]");
   if (!target) {
     const card = event.target.closest(".topic-card");
     if (card) { selectedId = card.dataset.id; route = "detail"; render(); }
+    return;
+  }
+  if (target.dataset.authMode) {
+    authMode = target.dataset.authMode;
+    authNotice = "";
+    renderAuth();
     return;
   }
   if (target.dataset.route) { route = target.dataset.route; if (route === "detail") return; render(); return; }
@@ -480,9 +762,11 @@ app.addEventListener("click", (event) => {
   if (action === "theme") {
     const previous = data.dark;
     data.dark = !data.dark;
-    if (!save()) data.dark = previous;
+    if (!await save()) data.dark = previous;
     render();
   }
+  else if (action === "logout") await signOut();
+  else if (action === "retry-account") await loadAccount(authUser);
   else if (action === "add") modalForm();
   else if (action === "edit") { const topic = data.topics.find((item) => item.id === id); if (topic) modalForm(topic); }
   else if (action === "close-modal") document.querySelector(".modal-backdrop")?.remove();
@@ -492,15 +776,29 @@ app.addEventListener("click", (event) => {
     if (window.confirm("Delete this topic and its revision history?")) {
       const previous = data.topics;
       data.topics = data.topics.filter((topic) => topic.id !== id);
-      if (!save()) { data.topics = previous; render(); return; }
+      if (!await save()) { data.topics = previous; render(); return; }
       route = "topics"; render(); toast("Topic deleted.");
     }
-  } else if (action === "complete-revision") completeRevision();
+  } else if (action === "complete-revision") await completeRevision();
   else if (action === "summary-done") { completionSummary = null; route = "room"; render(); }
   else if (action === "summary-detail") { selectedId = id; completionSummary = null; route = "detail"; render(); }
   else if (action === "export") exportData();
+  else if (action === "export-legacy") {
+    if (legacyData) {
+      exportData(legacyData, `studyspace-browser-backup-${todayISO()}.json`);
+      legacyBackupDownloaded = true;
+      renderSettings();
+    }
+  }
+  else if (action === "migrate") await migrateLegacyData();
   else if (action === "import") document.querySelector("#import-file")?.click();
-  else if (action === "remove-subject") removeSubject(target.dataset.subject);
+  else if (action === "send-reset") {
+    try {
+      await StudySpaceAuth.sendPasswordReset(authUser.email);
+      toast("If this address belongs to an invited account, a password reset link is on its way.");
+    } catch { toast("Could not send the password reset email. Check your connection and try again."); }
+  }
+  else if (action === "remove-subject") await removeSubject(target.dataset.subject);
 });
 app.addEventListener("keydown", (event) => {
   if (event.key === "Escape") document.querySelector(".modal-backdrop")?.remove();
@@ -515,7 +813,8 @@ app.addEventListener("input", (event) => {
     event.target.dataset.userEdited = "true";
   } else if (event.target.id === "revision-note") revisionNote = event.target.value;
 });
-app.addEventListener("change", (event) => {
+app.addEventListener("change", async (event) => {
+  if (persistenceBusy) return;
   if (event.target.dataset.filter) { filters[event.target.dataset.filter] = event.target.value; renderTopics(); }
   if (event.target.id === "topic-date" || event.target.id === "topic-level") {
     const form = event.target.closest("#topic-form");
@@ -531,12 +830,31 @@ app.addEventListener("change", (event) => {
     if (!Number.isInteger(value) || value < 1 || value > 365) { event.target.value = data.intervals[index]; toast("Choose an interval between 1 and 365 days."); return; }
     const previous = data.intervals[index];
     data.intervals[index] = value;
-    if (!save()) { data.intervals[index] = previous; renderSettings(); return; }
+    if (!await save()) { data.intervals[index] = previous; renderSettings(); return; }
     renderSettings(); toast("Revision interval updated.");
   }
-  if (event.target.id === "import-file") importData(event.target.files?.[0]);
+  if (event.target.id === "import-file") await importData(event.target.files?.[0]);
+  if (event.target.id === "migration-backup-confirm") {
+    legacyBackupConfirmed = event.target.checked;
+    renderSettings();
+  }
+  if (event.target.id === "migration-overwrite-confirm") {
+    legacyOverwriteConfirmed = event.target.checked;
+    renderSettings();
+  }
 });
-app.addEventListener("submit", (event) => {
+app.addEventListener("submit", async (event) => {
+  if (persistenceBusy) { event.preventDefault(); toast("Your changes are still being saved."); return; }
+  if (["login-form", "forgot-form", "invite-form", "recovery-form"].includes(event.target.id)) {
+    event.preventDefault();
+    await handleAuthFormSubmit(event);
+    return;
+  }
+  if (event.target.id === "profile-form") {
+    event.preventDefault();
+    await updateProfile(event.target);
+    return;
+  }
   if (event.target.id === "topic-form") {
     event.preventDefault();
     const formElement = event.target;
@@ -589,12 +907,14 @@ app.addEventListener("submit", (event) => {
     if (!data.subjects.includes(subject)) data.subjects.push(subject);
     selectedId = topic.id;
     if (!existing) filters = { search: "", subject: "", status: "", level: "", revision: "", sort: "next" };
-    const persisted = save();
+    const persisted = await save();
     if (!persisted) {
       data.topics = previousTopics;
       data.subjects = previousSubjects;
       data.activities = previousActivities;
       if (existing) Object.assign(existing, JSON.parse(previousTopic));
+      formElement.dataset.submitting = "false";
+      if (submitButton) submitButton.disabled = false;
       return;
     }
     document.querySelector(".modal-backdrop")?.remove(); route = existing ? "detail" : "topics"; render();
@@ -607,11 +927,11 @@ app.addEventListener("submit", (event) => {
     if (!name) return;
     if (data.subjects.some((subject) => subject.toLowerCase() === name.toLowerCase())) { toast("That subject already exists."); return; }
     data.subjects.push(name);
-    if (!save()) { data.subjects.pop(); return; }
+    if (!await save()) { data.subjects.pop(); return; }
     renderSettings(); toast("Subject added.");
   }
 });
-function completeRevision() {
+async function completeRevision() {
   if (!chosenLevel) { toast("Choose an understanding level to continue."); return; }
   const topic = data.topics.find((item) => item.id === revisionQueue[revisionIndex]);
   if (!topic) { toast("This topic could not be found."); return; }
@@ -625,7 +945,7 @@ function completeRevision() {
   topic.nextRevision = shiftDate(intervalDays);
   topic.history.push({ date: todayISO(), level: chosenLevel, note: revisionNote.trim() || "Revision session completed." });
   addActivity(`Revised ${topic.name}`, topic.name, chosenLevel, "revision");
-  if (!save()) {
+  if (!await save()) {
     Object.assign(topic, JSON.parse(previousTopic));
     data.activities = previousActivities;
     renderSession();
@@ -634,38 +954,35 @@ function completeRevision() {
   completionSummary = { topicId: topic.id, level: chosenLevel, intervalDays };
   renderSummary();
 }
-function removeSubject(subject) {
+async function removeSubject(subject) {
   if (data.topics.some((topic) => topic.subject === subject)) { toast("Move or delete its topics before removing this subject."); return; }
   const previous = data.subjects.slice();
   data.subjects = data.subjects.filter((item) => item !== subject);
-  if (!save()) { data.subjects = previous; renderSettings(); return; }
+  if (!await save()) { data.subjects = previous; renderSettings(); return; }
   renderSettings(); toast("Subject removed.");
 }
-function exportData() {
+function exportData(snapshot = data, filename = `studyspace-${todayISO()}.json`) {
   try {
-    const blob = new Blob([JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), ...data }, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), ...snapshot }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
-    anchor.href = url; anchor.download = `studyspace-${todayISO()}.json`; anchor.click();
+    anchor.href = url; anchor.download = filename; anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast("Study data exported.");
-  } catch (error) { console.error("Could not export StudySpace data.", error); toast("Could not export your data."); }
+    toast(snapshot === legacyData ? "Browser backup downloaded." : "Study data exported.");
+  } catch { toast("Could not export your data."); }
 }
-function importData(file) {
+async function importData(file) {
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const parsed = JSON.parse(String(reader.result));
-      const imported = validateImport(parsed);
-      const previous = data;
-      data = imported;
-      if (!save()) { data = previous; return; }
-      renderSettings(); toast("Study data imported.");
-    } catch (error) { toast(error.message || "Could not read that file."); }
-  };
-  reader.onerror = () => { console.error("Could not read selected import file."); toast("Could not read that file."); };
-  reader.readAsText(file);
+  try {
+    const imported = validateImport(JSON.parse(await file.text()));
+    if (!window.confirm("Importing this file will replace the study data in your cloud account. Export a backup first if you may need the current data. Continue?")) return;
+    const previous = data;
+    data = { ...imported, legacyImportCompletedAt: data.legacyImportCompletedAt };
+    if (!await save()) { data = previous; return; }
+    renderSettings(); toast("Study data imported.");
+  } catch (error) {
+    toast(error.message || "Could not read that file.");
+  }
 }
 function validateImport(parsed) {
   if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.topics)) {
@@ -674,14 +991,19 @@ function validateImport(parsed) {
   if (!Array.isArray(parsed.intervals) || parsed.intervals.length !== 5 || !parsed.intervals.every((days) => Number.isInteger(days) && days >= 1 && days <= 365)) {
     throw new Error("The export must contain five revision intervals between 1 and 365 days.");
   }
-  if (!Array.isArray(parsed.subjects) || !parsed.subjects.every((subject) => typeof subject === "string" && subject.trim())) {
+  if (!Array.isArray(parsed.subjects) || !parsed.subjects.every((subject) =>
+    typeof subject === "string" && subject.trim() && subject.trim().length <= 30)) {
     throw new Error("The export contains an invalid subject list.");
+  }
+  if (parsed.dark !== undefined && typeof parsed.dark !== "boolean") {
+    throw new Error("The export contains an invalid theme setting.");
   }
   const ids = new Set();
   const names = new Set();
   const topics = parsed.topics.map((topic, index) => {
-    if (!topic || typeof topic !== "object" || typeof topic.id !== "string" || !/^[a-zA-Z0-9._-]+$/.test(topic.id) ||
-      typeof topic.name !== "string" || !topic.name.trim() || typeof topic.subject !== "string" || !topic.subject.trim()) {
+    if (!topic || typeof topic !== "object" || typeof topic.id !== "string" || topic.id.length > 100 || !/^[a-zA-Z0-9._-]+$/.test(topic.id) ||
+      typeof topic.name !== "string" || !topic.name.trim() || topic.name.trim().length > 100 ||
+      typeof topic.subject !== "string" || !topic.subject.trim() || topic.subject.trim().length > 30) {
       throw new Error(`Topic ${index + 1} is missing a valid ID, name, or subject.`);
     }
     if (ids.has(topic.id)) throw new Error(`The export contains duplicate topic ID “${topic.id}”.`);
@@ -689,6 +1011,10 @@ function validateImport(parsed) {
     if (names.has(nameKey)) throw new Error(`The export contains duplicate topic “${topic.name}” in ${topic.subject}.`);
     if (!LEVELS.includes(topic.level) || !STATUS_OPTIONS.includes(topic.status)) throw new Error(`Topic “${topic.name}” has an invalid status or understanding level.`);
     if (!Number.isInteger(topic.revisionCount) || topic.revisionCount < 0) throw new Error(`Topic “${topic.name}” has an invalid revision count.`);
+    if ((topic.description !== undefined && typeof topic.description !== "string") ||
+      (topic.notes !== undefined && typeof topic.notes !== "string")) {
+      throw new Error(`Topic “${topic.name}” has invalid notes or description.`);
+    }
     if (topic.resource !== undefined && typeof topic.resource !== "string") throw new Error(`Topic “${topic.name}” has an invalid resource link.`);
     if (!isSafeResourceUrl(topic.resource || "")) throw new Error(`Topic “${topic.name}” has an unsafe resource link.`);
     if (!isDateOnly(topic.lastStudied) || (topic.nextRevision !== null && topic.nextRevision !== undefined && !isDateOnly(topic.nextRevision))) {
@@ -711,8 +1037,16 @@ function validateImport(parsed) {
     };
   });
   if (parsed.activities !== undefined && (!Array.isArray(parsed.activities) || !parsed.activities.every((item) =>
-    item && typeof item.text === "string" && typeof item.topicName === "string" && isDateOnly(item.date)))) {
+    item && typeof item.text === "string" && item.text.length <= 200 &&
+    typeof item.topicName === "string" && item.topicName.length <= 100 && isDateOnly(item.date) &&
+    (item.level === undefined || item.level === "" || LEVELS.includes(item.level)) &&
+    (item.type === undefined || ["update", "revision"].includes(item.type))))) {
     throw new Error("The export contains invalid activity records.");
+  }
+  if (parsed.legacyImportCompletedAt !== undefined &&
+    parsed.legacyImportCompletedAt !== null &&
+    (typeof parsed.legacyImportCompletedAt !== "string" || Number.isNaN(Date.parse(parsed.legacyImportCompletedAt)))) {
+    throw new Error("The export contains an invalid migration marker.");
   }
   const subjects = [];
   parsed.subjects.forEach((subject) => {
@@ -725,7 +1059,7 @@ function validateImport(parsed) {
   return {
     topics, subjects, intervals: [...parsed.intervals], dark: parsed.dark === true,
     activities: (parsed.activities || []).slice(-30),
+    legacyImportCompletedAt: parsed.legacyImportCompletedAt || null,
   };
 }
-render();
-if (startupWarning) toast(startupWarning);
+initializeAuth();
